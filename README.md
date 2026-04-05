@@ -45,7 +45,7 @@ cd recording-assignment
 npm install
 
 # 3. Run setup (starts Postgres + MinIO, creates env files, pushes schema)
-# ⚠️ Make sure Docker Desktop (or your Docker daemon) is running first!
+-- ⚠️ Make sure Docker Desktop (or your Docker daemon) is running first!
 chmod +x scripts/setup.sh
 ./scripts/setup.sh
 
