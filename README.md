@@ -45,18 +45,28 @@ cd recording-assignment
 npm install
 
 # 3. Run setup (starts Postgres + MinIO, creates env files, pushes schema)
+# ⚠️ Make sure Docker Desktop (or your Docker daemon) is running first!
 chmod +x scripts/setup.sh
 ./scripts/setup.sh
 
-# 3.5. (Alternative) Manual Environment Setup
-# If the setup script fails or you are using a remote database:
-# - Create `apps/server/.env` and add your DATABASE_URL and BUCKET variables.
-## BUCKET_KEY=minioadmin
-## BUCKET_SECRET=minioadmin
-## BUCKET_NAME=recordings
-## BUCKET_ENDPOINT=http://localhost:9000
-# - Create `apps/web/.env.local` and add NEXT_PUBLIC_SERVER_URL.
-# (Check the "Environment Variables" section below for the exact keys)
+### 3.5 (Alternative) Manual Environment Setup
+If the setup script fails or you are using a remote database, manually create the `.env` files:
+
+1. **Server (`apps/server/.env`)**
+   Create this file and add your `DATABASE_URL` and `BUCKET` variables. Example:
+   ```env
+   DATABASE_URL=postgresql://user:password@host:port/database
+   BUCKET_ENDPOINT=http://localhost:9000
+   BUCKET_KEY=minioadmin
+   BUCKET_SECRET=minioadmin
+   BUCKET_NAME=recordings
+   ```
+
+2. **Web (`apps/web/.env.local`)**
+   Create this file to define the API connection:
+   ```env
+   NEXT_PUBLIC_SERVER_URL=http://localhost:3000
+   ```
 
 # 4. Start development
 npm run dev
