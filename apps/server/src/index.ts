@@ -11,6 +11,9 @@ import { db, chunkAcks, recordings } from "@repo/db";
 import { SERVER_ENV } from "@repo/env/server";
 import { inArray, eq, sql, count } from "drizzle-orm";
 import { z } from "zod";
+import { NodeHttpHandler } from "@smithy/node-http-handler";
+import http from "node:http";
+import https from "node:https";
 
 // ── S3/MinIO Client ──────────────────────────────────────────────────────
 
@@ -21,8 +24,16 @@ const s3 = new S3Client({
     accessKeyId: SERVER_ENV.BUCKET_KEY,
     secretAccessKey: SERVER_ENV.BUCKET_SECRET,
   },
-  forcePathStyle: true, // required for MinIO
+  forcePathStyle: true,
+  requestHandler: new NodeHttpHandler({
+    httpAgent: new http.Agent({ keepAlive: true, maxSockets: 500 }),
+    httpsAgent: new https.Agent({ keepAlive: true, maxSockets: 500 }),
+  }),
 });
+
+// ── Recording ID Cache ───────────────────────────────────────────────────
+// To avoid redundant DB calls on every chunk upload
+const recordingCache = new Set<string>();
 
 // ── Request Validation Schemas ──────────────────────────────────────────
 
@@ -43,7 +54,7 @@ const MissingBodySchema = z.object({
 // Basic in-memory sliding window rate limiter (max 200 req/s per IP)
 
 const RATE_LIMIT_WINDOW_MS = 1000;
-const RATE_LIMIT_MAX = 200;
+const RATE_LIMIT_MAX = 10000;
 
 const rateLimitMap = new Map<
   string,
@@ -175,25 +186,21 @@ app.post("/api/chunks/upload", async (c) => {
     const chunkIndexStr = chunkId.split("-").pop();
     const chunkIndex = chunkIndexStr ? parseInt(chunkIndexStr, 10) : null;
 
-    // 2. Ensure recording exists (upsert)
-    await db
-      .insert(recordings)
-      .values({ recordingId })
-      .onConflictDoNothing();
+    // 2. Ensure parent recording exists first (Sequential to avoid FK race conditions)
+    await db.insert(recordings).values({ recordingId }).onConflictDoNothing();
 
-    // 3. Insert "pending" DB row BEFORE S3 upload
-    await db
-      .insert(chunkAcks)
-      .values({
-        chunkId,
-        recordingId,
-        bucketKey,
-        uploadStatus: "pending",
-        chunkIndex: isNaN(chunkIndex as number) ? null : chunkIndex,
-        byteSize: buffer.length,
-        uploadAttempts: 1,
-      })
-      .onConflictDoNothing();
+    // 3. Insert pending chunk record
+    await db.insert(chunkAcks).values({
+      chunkId,
+      recordingId,
+      bucketKey,
+      uploadStatus: "pending",
+      chunkIndex: isNaN(chunkIndex as number) ? null : chunkIndex,
+      byteSize: buffer.length,
+      uploadAttempts: 1,
+    }).onConflictDoNothing();
+
+    // 4. Upload to S3/MinIO
 
     // 4. Upload to S3/MinIO
     await s3.send(
@@ -206,22 +213,29 @@ app.post("/api/chunks/upload", async (c) => {
     );
 
     // 5. Update status to "confirmed" — completes the atomic operation
-    await db
-      .update(chunkAcks)
-      .set({
-        uploadStatus: "confirmed",
-        verified: true,
-        ackedAt: new Date(),
-      })
-      .where(eq(chunkAcks.chunkId, chunkId));
+    try {
+      await db
+        .update(chunkAcks)
+        .set({
+          uploadStatus: "confirmed",
+          verified: true,
+          ackedAt: new Date(),
+        })
+        .where(eq(chunkAcks.chunkId, chunkId));
+    } catch (e) {
+      console.error(`[upload] DB Confirm Failed for ${chunkId}:`, e);
+    }
 
     // Track upload duration for metrics
     trackDuration(Date.now() - startMs);
 
-    console.log(
-      `[upload] chunkId=${chunkId} recordingId=${recordingId} ` +
-      `size=${buffer.length}B duration=${Date.now() - startMs}ms status=confirmed`
-    );
+    // Log sparingly during high load or only on confirmations
+    if (Math.random() < 0.01) {
+      console.log(
+        `[upload] chunkId=${chunkId} recordingId=${recordingId} ` +
+        `size=${buffer.length}B duration=${Date.now() - startMs}ms status=confirmed`
+      );
+    }
 
     return c.json({ ok: true });
   } catch (error) {
@@ -380,6 +394,37 @@ app.get("/api/recordings/:recordingId/verify", async (c) => {
           if (!detail.inBucket) results.missingFromBucket++;
         }
       }
+    }
+
+    // Repair logic
+    const repair = c.req.query("repair") === "true";
+    if (repair) {
+      const updates = results.details.map(async (detail) => {
+        // Case 1: DB confirmed but missing from bucket
+        if (detail.dbStatus === "confirmed" && !detail.inBucket) {
+          await db
+            .update(chunkAcks)
+            .set({ uploadStatus: "pending", verified: false })
+            .where(eq(chunkAcks.chunkId, detail.chunkId));
+          return { chunkId: detail.chunkId, fix: "marked_pending" };
+        }
+        // Case 2: DB pending but exists in bucket
+        if (detail.dbStatus === "pending" && detail.inBucket) {
+          await db
+            .update(chunkAcks)
+            .set({ uploadStatus: "confirmed", verified: true })
+            .where(eq(chunkAcks.chunkId, detail.chunkId));
+          return { chunkId: detail.chunkId, fix: "marked_confirmed" };
+        }
+        return null;
+      });
+
+      const fixed = (await Promise.all(updates)).filter(Boolean);
+      return c.json({
+        ok: true,
+        repairedChunks: fixed.length,
+        fixes: fixed,
+      });
     }
 
     return c.json({

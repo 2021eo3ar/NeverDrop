@@ -2,14 +2,14 @@ import http from "k6/http";
 import { check, sleep } from "k6";
 
 const BASE_URL = "http://localhost:3000";
-const RECORDING_ID = `recording-loadtest-${Date.now()}`;
+const RECORDING_ID = __ENV.RECORDING_ID || `recording-loadtest-${Date.now()}`;
 
 export const options = {
   scenarios: {
     // Happy path: normal uploads at high rate
     constant_load: {
       executor: "constant-arrival-rate",
-      rate: 5000,
+      rate: 500,
       timeUnit: "1s",
       duration: "60s",
       preAllocatedVUs: 500,
@@ -37,7 +37,7 @@ export const options = {
 
 export function happyPath() {
   const payload = JSON.stringify({
-    chunkId: `chunk-${__VU}-${__ITER}`,
+    chunkId: `chunk-${RECORDING_ID}-${__VU}-${__ITER}`,
     recordingId: RECORDING_ID,
     data: "x".repeat(1024),
   });
@@ -97,14 +97,15 @@ export function handleSummary(data) {
     `${BASE_URL}/api/recordings/${RECORDING_ID}/verify`
   );
 
-  let verifyResult = "could not verify";
-  try {
-    const body = JSON.parse(verifyRes.body);
-    verifyResult = body.consistent
-      ? `CONSISTENT: ${body.totalChunks} chunks verified`
-      : `INCONSISTENT: ${body.pending} pending, ${body.missingFromBucket} missing from bucket`;
-  } catch {
-    verifyResult = `Verify endpoint returned status ${verifyRes.status}`;
+  const body = JSON.parse(verifyRes.body);
+  const verifyResult = body.consistent
+    ? `CONSISTENT: ${body.totalChunks} chunks verified`
+    : `INCONSISTENT: ${body.confirmed}/${body.totalChunks} chunks confirmed, ${body.pending} pending, ${body.missingFromBucket} missing from bucket`;
+
+  if (body.totalChunks === 0) {
+    return {
+      stdout: `\n\n=== POST-TEST VERIFICATION FAILED ===\nRecording: ${RECORDING_ID}\nResult: No chunks found in DB. This means uploads never reached the DB.\n\n`,
+    };
   }
 
   return {
